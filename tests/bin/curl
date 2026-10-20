@@ -1,0 +1,6 @@
+#!/bin/bash
+# Fake curl for the usage endpoint. Logs every call; FAKE_CURL=fail simulates
+# an unreachable endpoint, otherwise prints $FAKE_USAGE (a JSON file).
+printf '%s\n' "$*" >> "$HOME/curl.log"
+[[ "${FAKE_CURL:-ok}" == "fail" ]] && exit 22
+cat "${FAKE_USAGE:?FAKE_USAGE not set}"

@@ -1,0 +1,3 @@
+#!/bin/bash
+# Fake macOS Keychain lookup: hands back the test credentials file.
+cat "$HOME/.claude/.credentials.json" 2>/dev/null
