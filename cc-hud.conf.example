@@ -1,0 +1,2 @@
+# Every key: bash cc-hud.sh --legend (Config section).
+STATUSLINE_THEME=dark
