@@ -1218,10 +1218,12 @@ printf "${D}%s%s${R}${Y}%s%s${R}" "$g_sess" "${g_sess:+ }" "$cur" "$session_cost
 # fresh prompt doesn't show a dead [+$0.00].
 if [[ -n "$pd_delta" && "$pd_delta" != "0.00" ]]; then
   pd_txt="${g_prompt}${g_prompt:+ }+${cur}$pd_delta"
+  # Leading "(" on each pattern: bash 3.2 (macOS /bin/bash) misreads a bare
+  # "up)" inside $( ) as the end of the substitution.
   case "$pd_dir" in
-    up)   pd_col="$RED"; pd_txt+=" ↑${pd_dev}%" ;;
-    down) pd_col="$G";   pd_txt+=" ↓${pd_dev}%" ;;
-    *)    pd_col="$D" ;;
+    (up)   pd_col="$RED"; pd_txt+=" ↑${pd_dev}%" ;;
+    (down) pd_col="$G";   pd_txt+=" ↓${pd_dev}%" ;;
+    (*)    pd_col="$D" ;;
   esac
   printf "\x1e ${D}[${R}${pd_col}%s${R}${D}]${R}" "$pd_txt"
 fi
