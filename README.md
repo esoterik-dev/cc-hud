@@ -33,3 +33,9 @@ Then in `~/.claude/settings.json`:
 3. `cost.total_cost_usd`: computed locally at list rates; fine as a per-session gauge, not a bill.
 
 See the header comment in `cc-hud.sh` for details.
+
+`/api/oauth/usage` is an undocumented endpoint that Claude Code itself calls; its fields may change between Claude Code releases. The script calls it at most once every 5 minutes, in the background.
+
+## License
+
+MIT
