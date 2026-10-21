@@ -28,7 +28,7 @@ plan() {  # plan pro|max|enterprise|none: the subscription the credentials file 
   printf '{"claudeAiOauth":{"accessToken":"test-token-123","subscriptionType":"%s"}}\n' "$1" \
     > "$T/.claude/.credentials.json"
 }
-NOW=$(date +%s)
+NOW=$(date +%s)   # reset before each test: countdown checks assume little time has passed
 # Claude Code runs the command in the user's (UTF-8) locale; env -i would drop it.
 UTF8=$(locale -a 2>/dev/null | grep -iE '^(C|en_US)\.UTF-?8$' | head -1)
 iso() { date -u -d "@$1" +%Y-%m-%dT%H:%M:%SZ 2>/dev/null || date -u -r "$1" +%Y-%m-%dT%H:%M:%SZ; }
@@ -304,7 +304,7 @@ test_cache_misses() {
 # After a resume Claude Code sends prompt_cache: null until the first new
 # request, so the cache state comes from the transcript instead.
 test_resumed_session_counts_down_from_the_transcript() {
-  plan enterprise; reply 120
+  plan enterprise; reply 130
   render 'del(.prompt_cache)'
   check matches '⏱️ 5m · 2m [0-9]+s left'
   check has "▶ resume"
@@ -318,7 +318,7 @@ test_resumed_session_shows_cold_from_the_transcript() {
   render 'del(.prompt_cache)'
   check has "⏱️ 5m ·  cold"
   check has "↻ new session"             # 84k context on a cold cache
-  rm -rf "$T/.claude/.token-cache"; : > "$TRANSCRIPT"; reply 120 1h
+  rm -rf "$T/.claude/.token-cache"; : > "$TRANSCRIPT"; reply 130 1h
   with FORCE_PROMPT_CACHING_5M=1 -- render 'del(.prompt_cache)'; check matches '5m · 2m [0-9]+s left'
 }
 test_resume_estimate_yields_to_stdin_and_compaction() {
@@ -555,7 +555,7 @@ test_cold_block_reads_huge_transcripts() {
 
 # ===========================================================================
 for t in $(declare -F | awk '{print $3}' | grep '^test_' | grep -- "${1:-}"); do
-  new_home; EXTRA_ENV=(); WRAP=(); _ok=1
+  new_home; EXTRA_ENV=(); WRAP=(); _ok=1; NOW=$(date +%s)
   "$t"
   if (( _ok )); then pass=$((pass+1)); printf '✓ %s\n' "${t#test_}"
   else fail=$((fail+1)); failed+=("$t"); printf '✗ %s\n' "${t#test_}"; fi
