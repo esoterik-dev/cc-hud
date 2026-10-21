@@ -365,6 +365,115 @@ test_narrow_terminal_wraps() {
 }
 
 # ===========================================================================
+# hooks/question-guard.sh — PostToolUse(AskUserQuestion)
+# ===========================================================================
+hook() {  # hook <script> <stdin json>: runs a hook as Claude Code does
+  OUT=$(printf '%s' "$2" | env -i HOME="$T" PATH="$PATH" LANG="${UTF8:-C.UTF-8}" \
+        ${EXTRA_ENV[@]+"${EXTRA_ENV[@]}"} bash "$ROOT/hooks/$1" 2>/dev/null)
+  STATUS=$?; PLAIN=$OUT
+}
+blocked()  { [[ "$(jq -r .decision <<< "$OUT" 2>/dev/null)" == block ]] || { printf '      not blocked; output: %s\n' "$OUT"; return 1; }; }
+allowed()  { [[ -z "$OUT" ]] || { printf '      expected no output, got: %s\n' "$OUT"; return 1; }; }
+reason_has()   { jq -r .reason <<< "$OUT" | grep -qF -- "$1" || { printf '      reason lacks: %s\n%s\n' "$1" "$(jq -r .reason <<< "$OUT")"; return 1; }; }
+reason_lacks() { ! jq -r .reason <<< "$OUT" | grep -qF -- "$1" || { printf '      reason has: %s\n' "$1"; return 1; }; }
+auq() {  # auq <answers-json>: PostToolUse input for two questions
+  jq -nc --argjson a "$1" '{hook_event_name:"PostToolUse", tool_name:"AskUserQuestion",
+    tool_input:{questions:[{question:"Colour?",options:[{label:"red"},{label:"blue"}]},
+                           {question:"Finish?",options:[{label:"matte"},{label:"gloss"}]}]},
+    tool_response:{answers:$a}}'
+}
+test_guard_lets_answered_questions_through() {
+  hook question-guard.sh "$(auq '{"Colour?":"red","Finish?":"gloss"}')"
+  check exit0; check allowed
+}
+test_guard_blocks_a_timed_out_question() {
+  hook question-guard.sh "$(auq '{}')"
+  check exit0; check blocked
+  check reason_has "Do not proceed"; check reason_has "End your turn"
+  check reason_has "- Colour? (options: red / blue)"; check reason_has "- Finish? (options: matte / gloss)"
+}
+test_guard_keeps_partial_answers() {
+  hook question-guard.sh "$(auq '{"Colour?":"blue"}')"
+  check blocked
+  check reason_has "- Finish? (options: matte / gloss)"
+  check reason_has "- Colour? → blue"
+  check reason_lacks "- Colour? (options"
+}
+test_guard_ignores_bad_input() {
+  hook question-guard.sh 'not json'; check exit0; check allowed
+  hook question-guard.sh '{}';       check exit0; check allowed
+}
+
+# ===========================================================================
+# hooks/cold-cache-block.sh — UserPromptSubmit
+# ===========================================================================
+reply() {  # reply <seconds ago> [5m|1h]: a main-chain response in the transcript
+  local k=ephemeral_5m_input_tokens; [[ "${2:-5m}" == 1h ]] && k=ephemeral_1h_input_tokens
+  jq -nc --arg ts "$(iso $((NOW - $1)))" --arg k "$k" '{type:"assistant", timestamp:$ts,
+    message:{model:"claude-opus-5-5", usage:{input_tokens:3, cache_read_input_tokens:148000,
+    cache_creation_input_tokens:2000, cache_creation:{($k):2000}}}}' >> "$TRANSCRIPT"
+}
+ups() {  # ups <prompt>: UserPromptSubmit input for this session
+  jq -nc --arg p "$1" --arg tr "$TRANSCRIPT" '{hook_event_name:"UserPromptSubmit",
+    session_id:"sess-1", transcript_path:$tr, prompt:$p}'
+}
+test_cold_block_allows_a_warm_cache() {
+  reply 120; hook cold-cache-block.sh "$(ups "next step")"
+  check exit0; check allowed
+}
+test_cold_block_blocks_an_expired_cache() {
+  reply 400; hook cold-cache-block.sh "$(ups "next step")"
+  check exit0; check blocked
+  check reason_has "Prompt cache expired 6m ago (5m cache)"
+  check reason_has "about 150.0k tokens"
+  check reason_has "within 30 seconds"
+}
+test_cold_block_uses_the_1h_lifetime() {
+  reply 400 1h;  hook cold-cache-block.sh "$(ups "next")"; check allowed
+  : > "$TRANSCRIPT"; reply 3700 1h; hook cold-cache-block.sh "$(ups "next")"
+  check blocked; check reason_has "(1h cache)"
+  : > "$TRANSCRIPT"; reply 400 1h
+  with FORCE_PROMPT_CACHING_5M=1 -- hook cold-cache-block.sh "$(ups "forced")"; check blocked
+}
+test_cold_block_resend_within_30s_goes_through() {
+  reply 400
+  hook cold-cache-block.sh "$(ups "do it")";    check blocked
+  hook cold-cache-block.sh "$(ups "other")";    check blocked     # a different prompt is a new block
+  hook cold-cache-block.sh "$(ups "other")";    check allowed     # the same one again: through
+  hook cold-cache-block.sh "$(ups "do it")";    check blocked
+  echo "$((NOW - 31)) $(printf 'do it' | cksum | cut -d' ' -f1)" > "$T/.claude/.cold-block/sess-1"
+  hook cold-cache-block.sh "$(ups "do it")";    check blocked     # too late: blocked again
+}
+test_cold_block_never_blocks_machine_prompts_or_commands() {
+  reply 400
+  local p
+  for p in "[cache-warm] Keep-alive ping to refresh the prompt cache." \
+           "<task-notification><summary>Stop hook feedback</summary></task-notification>" \
+           "<system-reminder>x</system-reminder>" "/clear" "/compact" "!ls" "   " ; do
+    hook cold-cache-block.sh "$(ups "$p")"; check allowed
+  done
+}
+test_cold_block_skips_first_prompt_compaction_and_headless() {
+  hook cold-cache-block.sh "$(ups "hello")"; check allowed               # no response yet
+  reply 400
+  jq -nc --arg ts "$(iso $((NOW - 100)))" '{type:"system", subtype:"compact_boundary", timestamp:$ts}' >> "$TRANSCRIPT"
+  hook cold-cache-block.sh "$(ups "go on")"; check allowed               # compacted since
+  : > "$TRANSCRIPT"; reply 400
+  with CLAUDE_CODE_ENTRYPOINT=sdk-cli -- hook cold-cache-block.sh "$(ups "go on")"; check allowed
+}
+test_cold_block_rejects_odd_session_ids() {
+  reply 400
+  hook cold-cache-block.sh "$(ups "x" | jq -c '.session_id = "../../evil"')"
+  check allowed; check [ ! -e "$T/.claude/evil" ]
+}
+test_cold_block_reads_huge_transcripts() {
+  # A tool result bigger than the 4 MB tail: the response line falls outside it.
+  reply 400
+  head -c 5000000 /dev/zero | tr '\0' 'x' | jq -Rc '{type:"user", message:{content:.}}' >> "$TRANSCRIPT"
+  hook cold-cache-block.sh "$(ups "next")"; check blocked
+}
+
+# ===========================================================================
 for t in $(declare -F | awk '{print $3}' | grep '^test_' | grep -- "${1:-}"); do
   new_home; EXTRA_ENV=(); _ok=1
   "$t"

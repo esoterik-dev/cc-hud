@@ -100,11 +100,46 @@ Each figure says how far to trust it: `$` is official, `~$` is a local estimate,
 ## Privacy
 
 - To call the usage endpoint, the script reads your Claude Code OAuth token from `~/.claude/.credentials.json` (on macOS, from the Keychain). The token is sent only to `api.anthropic.com` and never written anywhere.
-- Everything else stays local: small cache files under `~/.claude/` (`.usage-*`, `.monthly-cost-*`, `.session-costs/`, `.prompt-costs/`, `.token-cache/`). Per-prompt and per-day files are pruned after one to two weeks; the rest stay until you delete them.
+- Everything else stays local: small cache files under `~/.claude/` (`.usage-*`, `.monthly-cost-*`, `.session-costs/`, `.prompt-costs/`, `.token-cache/`, and `.cold-block/` for the cache hook). Per-prompt and per-day files are pruned after one to two weeks; the rest stay until you delete them.
 
 ## cache-warm
 
 If you run the claude-cache-warm plugin (keep-alive pings that stop an idle session's prompt cache from expiring), row 3 shows what it is doing: the countdown to the next ping and how many it has sent since you were last active, or "stopped after N (cap)" once it gives up. Without the plugin the segment stays hidden.
+
+## Cache hooks (optional)
+
+Two small hooks in `hooks/` stop the two common ways a session pays to re-write its whole prompt cache. They work with or without cache-warm and need only `bash` and `jq`.
+
+**`question-guard.sh`: don't move on without an answer.** Claude Code can close an unanswered question after a while (`askUserQuestionTimeout`). It then tells Claude to *"proceed using your best judgment"*. With this hook, Claude stops instead: it restates what is still open in plain text, keeps any answers you did give, and ends its turn. Ending the turn also lets a keep-alive like cache-warm keep the cache warm while you're away. An open question blocks the keep-alive, because Claude Code holds it back until you answer.
+
+**`cold-cache-block.sh`: warn before a cold re-write.** When the prompt cache has expired (5 minutes or 1 hour after the last response, depending on the session), your next message is held back with a note like this:
+
+```
+Prompt cache expired 7m ago (5m cache). Sending this would re-write about 150.0k tokens of context at full price.
+Cheaper: start a new session (/clear, or a new claude) and pick up from your progress notes.
+Your message is back in the input box: press Enter within 30 seconds to send it here anyway.
+```
+
+Claude Code puts the blocked message back in the input box, so pressing Enter within 30 seconds sends it anyway (any resend of the same text in that window goes through). Keep-alive pings, background-task reports, slash commands, a session's first message, the first message after a compaction and `claude -p` runs are never blocked.
+
+To turn them on, add this to `~/.claude/settings.json` (merge with any `hooks` you already have):
+
+```json
+{
+  "askUserQuestionTimeout": "60s",
+  "hooks": {
+    "PostToolUse": [
+      { "matcher": "AskUserQuestion",
+        "hooks": [{ "type": "command", "command": "bash ~/.local/share/cc-hud/hooks/question-guard.sh" }] }
+    ],
+    "UserPromptSubmit": [
+      { "hooks": [{ "type": "command", "command": "bash ~/.local/share/cc-hud/hooks/cold-cache-block.sh" }] }
+    ]
+  }
+}
+```
+
+`askUserQuestionTimeout` accepts `"60s"`, `"5m"`, `"10m"` or `"never"` (the default), and it's also under **Question auto-continue timeout** in `/config`. Use `60s` if you want the cache kept warm. `5m` closes the question just as a 5-minute cache expires.
 
 ## Troubleshooting
 
@@ -127,7 +162,7 @@ bash tests/run.sh           # all tests
 bash tests/run.sh cache     # only tests whose name contains "cache"
 ```
 
-The tests run the real script exactly as Claude Code does — JSON on stdin, output on stdout — in a throwaway `$HOME`, with `curl` and the macOS `security` command replaced by fakes in `tests/bin/`. Nothing touches your own `~/.claude`. CI runs them on Linux and macOS.
+The tests run the real script and hooks exactly as Claude Code does — JSON on stdin, output on stdout — in a throwaway `$HOME`, with `curl` and the macOS `security` command replaced by fakes in `tests/bin/`. Nothing touches your own `~/.claude`. CI runs them on Linux and macOS.
 
 ### Demo
 
