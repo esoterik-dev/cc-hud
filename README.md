@@ -95,12 +95,14 @@ Each figure says how far to trust it: `$` is official, `~$` is a local estimate,
 2. **The JSON Claude Code passes on stdin** — context window, model, session cost, rate limits, prompt cache state.
 3. **Your session transcript** — the token breakdown and prompt count.
 
+**After `/resume`.** Claude Code sends the context window again straight away, but its prompt cache state stays empty until your first new request, and its miss counter then starts over at zero. So until that request, row 3 estimates the cache from the transcript: the last response plus the cache lifetime (5 minutes or 1 hour), the same way Claude Code judges whether a resumed cache has likely expired. The miss counter adds up every run of the session.
+
 `/api/oauth/usage` is an undocumented endpoint that Claude Code itself calls, so its fields may change between Claude Code releases. When it's unreachable, the month figure falls back to a local estimate marked `~`.
 
 ## Privacy
 
 - To call the usage endpoint, the script reads your Claude Code OAuth token from `~/.claude/.credentials.json` (on macOS, from the Keychain). The token is sent only to `api.anthropic.com` and never written anywhere.
-- Everything else stays local: small cache files under `~/.claude/` (`.usage-*`, `.monthly-cost-*`, `.session-costs/`, `.prompt-costs/`, `.token-cache/`, and `.cold-block/` for the cache hook). Per-prompt and per-day files are pruned after one to two weeks; the rest stay until you delete them.
+- Everything else stays local: small cache files under `~/.claude/` (`.usage-*`, `.monthly-cost-*`, `.session-costs/`, `.prompt-costs/`, `.token-cache/`, `.cache-misses/`, and `.cold-block/` for the cache hook). Per-prompt, per-day and cache-miss files are pruned after one to two weeks; the rest stay until you delete them.
 
 ## cache-warm
 

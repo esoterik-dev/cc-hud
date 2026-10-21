@@ -164,9 +164,11 @@ ${b}Lines 2–3${z} ${d}(cache TTL, verdict, cache-warm and misses on line 3)${z
   ${g_ttl}  cache TTL + time left before the ${b}current${z} warm prefix goes cold
       ${d}green: plenty of time left · yellow: getting close · red: about to${z}
       ${d}expire. Shows ${b}cold${z} on a red background once it has — the next request${z}
-      ${d}pays a full rewrite instead of a cheap read. Hidden until this session${z}
-      ${d}has shown any cache activity, or on clients before v2.1.251 (no${z}
-      ${d}prompt_cache field). STATUSLINE_CACHE_TTL=0 hides it unconditionally.${z}
+      ${d}pays a full rewrite instead of a cheap read. Right after a resume, until${z}
+      ${d}the first new request, it is estimated from the transcript (last response${z}
+      ${d}+ TTL); clients before v2.1.251 (no prompt_cache field) always get that${z}
+      ${d}estimate. Before the first response only the TTL shows, when known.${z}
+      ${d}STATUSLINE_CACHE_TTL=0 hides it unconditionally.${z}
   ▶ ◐ ↻  resume-or-restart verdict for the selected model and cache state
       ${d}▶ resume       cheaper to keep going in this session${z}
       ${d}◐ quick only   resume for a quick follow-up (≤8 requests); start a new${z}
@@ -176,8 +178,9 @@ ${b}Lines 2–3${z} ${d}(cache TTL, verdict, cache-warm and misses on line 3)${z
       ${d}(ctx/limit) = current context / the threshold it was judged against.${z}
       ${d}STATUSLINE_VERDICT=0 hides it.${z}
   ✗  cache misses this session + tokens they re-wrote, with the last cause
-      ${d}(ttl, tools, system, model, rewrite, server, ?). Compactions don't${z}
-      ${d}count — those are expected rebuilds. Hidden at 0.${z}
+      ${d}(ttl, tools, system, model, rewrite, server, ?). Counted across resumes${z}
+      ${d}(kept two weeks after the last change). Compactions don't count —${z}
+      ${d}those are expected rebuilds. Hidden at 0.${z}
       ${d}STATUSLINE_CACHE_MISSES=0 hides it.${z}
   ${g_warm}  claude-cache-warm keep-alive: next ping countdown + pings sent since${z}
       ${d}you were last active; "stopped after N (cap)" once it gives up, so the${z}
@@ -276,7 +279,7 @@ oauth_token() {
 # keeps empty fields as empty fields instead of swallowing the delimiter.
 IFS=$'\x1f' read -r cwd model_name model_id output_style effort_level transcript session_id \
   session_cost_in ctx_max ctx_pct ctx_tok rl5_pct rl7_pct rl5_reset rl7_reset \
-  pc_ttl pc_expires pc_warm pc_observed pc_misses pc_miss_tok pc_miss_cause <<< "$(
+  pc_ttl pc_expires pc_warm pc_observed pc_requests pc_misses pc_miss_tok pc_miss_cause <<< "$(
   echo "$input" | jq -r '
   # resets_at -> epoch seconds, whether it arrives as epoch s/ms or ISO-8601.
   def ep: if type == "number" then (if . > 1e12 then . / 1000 else . end | floor)
@@ -302,6 +305,7 @@ IFS=$'\x1f' read -r cwd model_name model_id output_style effort_level transcript
     (.prompt_cache.expires_at // ""),
     (.prompt_cache.warm // false),
     (.prompt_cache.caching_observed // false),
+    (.prompt_cache.requests // 0),
     (.prompt_cache.misses // 0),
     (.prompt_cache.miss_recache_tokens // 0),
     (.prompt_cache.last_miss_cause.causes[0]? // "")
@@ -350,13 +354,13 @@ fi
 # since the last render, keyed per session under ~/.claude/.token-cache/.
 tok_cache="$HOME/.claude/.token-cache/${session_id:-unknown}"
 tok_sig=""
-# The v2: prefix invalidates cache files written before last_ctx was added.
-[[ -n "$transcript" && -f "$transcript" ]] && tok_sig="v2:$(file_size "$transcript" 2>/dev/null)"
+# The v3: prefix invalidates cache files written before the last_* fields were added.
+[[ -n "$transcript" && -f "$transcript" ]] && tok_sig="v3:$(file_size "$transcript" 2>/dev/null)"
 
-in_tok=0; out_tok=0; cr_tok=0; cw_tok=0; n_prompt=0; last_ctx=""
+in_tok=0; out_tok=0; cr_tok=0; cw_tok=0; n_prompt=0; last_ctx=""; last_at="-"; last_ttl="-"; last_compacted=0
 cached_sig=""
 if [[ -n "$tok_sig" && -s "$tok_cache" ]]; then
-  read -r cached_sig in_tok out_tok cr_tok cw_tok n_prompt last_ctx < "$tok_cache" 2>/dev/null
+  read -r cached_sig in_tok out_tok cr_tok cw_tok n_prompt last_ctx last_at last_ttl last_compacted < "$tok_cache" 2>/dev/null
 fi
 
 if [[ -n "$transcript" && -f "$transcript" && "$cached_sig" != "$tok_sig" ]]; then
@@ -367,6 +371,10 @@ if [[ -n "$transcript" && -f "$transcript" && "$cached_sig" != "$tok_sig" ]]; th
   # NOT be written as truth, or it freezes at 0 until the file size next
   # changes — fall back to whatever was already cached instead.
   tok_line=$(jq -rs '
+      def ts: (.timestamp // "") | sub("\\.[0-9]+"; "") | (try fromdateiso8601 catch null);
+      [.[] | select(.type=="assistant" and .message.usage and (.isSidechain | not)
+                    and .message.model != "<synthetic>")] as $main |
+      ($main | last) as $last |
       ([.[] | select(.type=="assistant" and .message.usage)]
        | group_by(.message.id)
        | map(max_by(.message.usage.output_tokens // 0))) as $m |
@@ -376,18 +384,27 @@ if [[ -n "$transcript" && -f "$transcript" && "$cached_sig" != "$tok_sig" ]]; th
         ($m | map(.message.usage.cache_creation_input_tokens // 0) | add // 0),
         ([.[] | select(.promptSource != null and (.isSidechain | not))] | length),
         # Live context = the last main-chain request, not the session sums above.
-        ([.[] | select(.type=="assistant" and .message.usage and (.isSidechain | not)
-                       and .message.model != "<synthetic>")] | last | .message.usage
+        ($last | .message.usage
          | ((.input_tokens // 0) + (.cache_read_input_tokens // 0)
-            + (.cache_creation_input_tokens // 0))) // 0
+            + (.cache_creation_input_tokens // 0))) // 0,
+        # For the cache estimate after a resume: when that request was made, the
+        # lifetime of the last cache write, and whether a compaction came after it.
+        (($last | ts) // "-"),
+        ([$main[] | .message.usage.cache_creation
+          | if (.ephemeral_1h_input_tokens // 0) > 0 then "1h"
+            elif (.ephemeral_5m_input_tokens // 0) > 0 then "5m" else empty end] | last // "-"),
+        (([.[] | select(.type=="system" and .subtype=="compact_boundary") | ts | numbers] | max) as $c
+         | if $c != null and ($last | ts) != null and $c >= ($last | ts) then 1 else 0 end)
       ] | @tsv
     ' "$transcript" 2>/dev/null)
   if [[ $? -eq 0 && -n "$tok_line" ]]; then
-    read -r in_tok out_tok cr_tok cw_tok n_prompt last_ctx <<< "$tok_line"
+    read -r in_tok out_tok cr_tok cw_tok n_prompt last_ctx last_at last_ttl last_compacted <<< "$tok_line"
     in_tok=${in_tok:-0}; out_tok=${out_tok:-0}; cr_tok=${cr_tok:-0}
     cw_tok=${cw_tok:-0}; n_prompt=${n_prompt:-0}; last_ctx=${last_ctx:-0}
+    last_at=${last_at:--}; last_ttl=${last_ttl:--}; last_compacted=${last_compacted:-0}
     mkdir -p "$HOME/.claude/.token-cache" 2>/dev/null
-    printf '%s %s %s %s %s %s %s\n' "$tok_sig" "$in_tok" "$out_tok" "$cr_tok" "$cw_tok" "$n_prompt" "$last_ctx" > "$tok_cache" 2>/dev/null
+    printf '%s %s %s %s %s %s %s %s %s %s\n' "$tok_sig" "$in_tok" "$out_tok" "$cr_tok" "$cw_tok" "$n_prompt" \
+      "$last_ctx" "$last_at" "$last_ttl" "$last_compacted" > "$tok_cache" 2>/dev/null
   fi
 fi
 
@@ -634,6 +651,7 @@ if [[ $(cache_age_of "$cache_file") -gt 300 ]]; then
     # Piggy-back the per-prompt state cleanup: one pair of small files per
     # session accumulates otherwise. Throttled with this block, never inline.
     find "$pd_root" -maxdepth 1 -type f -mtime +14 -delete 2>/dev/null
+    find "$HOME/.claude/.cache-misses" -maxdepth 1 -type f -mtime +14 -delete 2>/dev/null
     # Same for the daily buckets: drop day files past a week, then the day
     # directories they leave empty. -name '2*' keeps this away from .cursor.
     find "$day_root" -mindepth 2 -maxdepth 2 -type f -name '*.txt' -mtime +7 -delete 2>/dev/null
@@ -1029,6 +1047,74 @@ if (( consumer_plan && plan_limits )) && [[ "$r5" =~ ^[0-9]+$ ]]; then
     fi
     (( b_n >= 2 )) && burn_seg+="${brk} ${eL}·${eR} ${b_col}${b_chance}% chance to run out${eR}"
   fi
+fi
+
+# --- Cache misses across resumes ---
+# prompt_cache counts per Claude Code process: a resumed session starts again
+# from zero. So each process's latest counters are kept as one line, per
+# session, under ~/.claude/.cache-misses/:
+#   <process> <requests> <misses> <tokens> <cause> <updated>
+# and the segment shows their sum. The process is the status line's first
+# non-shell ancestor: Claude Code itself, the same for every render of one run.
+# A line whose requests go down belongs to a new process that reused the id;
+# it is kept under a new name.
+miss_ledger="$HOME/.claude/.cache-misses/$session_id"
+if [[ "${STATUSLINE_CACHE_MISSES:-1}" != "0" && -n "$session_id" ]]; then
+  ml_key=""
+  if [[ "$pc_observed" == "true" ]]; then
+    ml_key=$PPID
+    for _ in 1 2 3 4 5 6; do
+      read -r ml_parent ml_comm < <(ps -o ppid= -o comm= -p "$ml_key" 2>/dev/null)
+      ml_comm=${ml_comm##*/}; ml_comm=${ml_comm#-}
+      case "$ml_comm" in
+        sh|bash|dash|zsh|fish|ksh|mksh) [[ "$ml_parent" =~ ^[0-9]+$ ]] && ml_key=$ml_parent || break ;;
+        *) break ;;
+      esac
+    done
+  fi
+  if [[ -n "$ml_key" || -s "$miss_ledger" ]]; then
+    ml_tmp="$miss_ledger.$$"
+    mkdir -p "${miss_ledger%/*}" 2>/dev/null
+    read -r pc_misses pc_miss_tok ml_cause < <(
+      { [[ -s "$miss_ledger" ]] && cat "$miss_ledger"; } | awk -v k="$ml_key" -v r="$pc_requests" \
+          -v m="$pc_misses" -v t="$pc_miss_tok" -v c="${pc_miss_cause:--}" -v now="$(date +%s)" -v out="$ml_tmp" '
+        NF == 6 && $1 != "" {
+          if (k != "" && $1 == k) {
+            if (r + 0 < $2 + 0) $1 = $1 "-" $6
+            else { if ($2 == r && $3 == m && $4 == t && $5 == c) mine = $0; next }
+          }
+          line[++n] = $0
+        }
+        END {
+          if (k != "") line[++n] = (mine != "" ? mine : k " " r " " m " " t " " c " " now)
+          for (i = 1; i <= n; i++) {
+            print line[i] > out
+            split(line[i], f, " "); sm += f[3]; st += f[4]
+            if (f[3] > 0 && f[5] != "-" && f[6] + 0 >= best) { best = f[6] + 0; cause = f[5] }
+          }
+          printf "%d %d %s\n", sm, st, (cause == "" ? "-" : cause)
+        }' 2>/dev/null)
+    [[ "$ml_cause" == "-" ]] && ml_cause=""
+    pc_miss_cause="$ml_cause"
+    if [[ -s "$ml_tmp" ]] && ! cmp -s "$ml_tmp" "$miss_ledger"; then mv -f "$ml_tmp" "$miss_ledger"
+    else rm -f "$ml_tmp"; fi
+  fi
+fi
+
+# --- Cache state after a resume ---
+# A resumed session gets prompt_cache: null until its first new request. Until
+# then, judge the cache the way Claude Code does for prompt_cache_likely_expired:
+# the last main-chain response plus the lifetime of its cache writes. Forcing
+# 5m wins, then the transcript, then the configured TTL. Skipped after a
+# compaction: the cache that response wrote is no longer the prefix.
+if [[ "$pc_observed" != "true" && "$last_at" =~ ^[0-9]+$ && "$last_compacted" != "1" ]]; then
+  if [[ -z "$FORCE_PROMPT_CACHING_5M" && ( "$last_ttl" == "5m" || "$last_ttl" == "1h" ) ]]; then pc_ttl=$last_ttl
+  elif [[ -z "$pc_ttl" ]]; then
+    [[ "${ENABLE_PROMPT_CACHING_1H:-}" == "1" ]] && pc_ttl="1h" || pc_ttl="5m"
+  fi
+  r_secs=300; [[ "$pc_ttl" == "1h" ]] && r_secs=3600
+  pc_expires=$(( last_at + r_secs ))
+  pc_warm=true; pc_observed=true
 fi
 
 # --- Cache-TTL segment: time left before the *current* warm prefix goes cold,

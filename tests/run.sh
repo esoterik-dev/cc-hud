@@ -51,13 +51,19 @@ render() {
   local filter=${1:-.}
   OUT=$(base_json | jq -c "$filter" | env -i HOME="$T" PATH="$FAKES:$PATH" \
         LANG="${UTF8:-C.UTF-8}" TERM=xterm FAKE_USAGE="$USAGE" ${EXTRA_ENV[@]+"${EXTRA_ENV[@]}"} \
-        bash "$SCRIPT" 9>&1)
+        ${WRAP[@]+"${WRAP[@]}"} bash "$SCRIPT" 9>&1)
   STATUS=$?
   PLAIN=$(printf '%s' "$OUT" | sed $'s/\x1b\\[[0-9;]*m//g')
 }
 with() {  # with VAR=val... -- render ...: environment for that one render
   EXTRA_ENV=(); while [[ "$1" != "--" ]]; do EXTRA_ENV+=("$1"); shift; done; shift
   "$@"; EXTRA_ENV=()
+}
+# Plain renders share one parent process, like one running Claude Code. A
+# render through new_process gets a parent of its own, like a resumed session.
+new_process() {
+  WRAP=(python3 -c 'import subprocess, sys; sys.exit(subprocess.call(sys.argv[1:], pass_fds=(9,)))')
+  "$@"; WRAP=()
 }
 render_raw() {  # render_raw <stdin text>
   OUT=$(printf '%s' "$1" | env -i HOME="$T" PATH="$FAKES:$PATH" bash "$SCRIPT" 9>&1 2>/dev/null)
@@ -294,6 +300,58 @@ test_cache_misses() {
   check has "✗ 2 misses · 150.0k rewritten (ttl)"
   render '.prompt_cache = {caching_observed:true, misses:0}'; check lacks "✗"
 }
+
+# After a resume Claude Code sends prompt_cache: null until the first new
+# request, so the cache state comes from the transcript instead.
+test_resumed_session_counts_down_from_the_transcript() {
+  plan enterprise; reply 120
+  render 'del(.prompt_cache)'
+  check matches '⏱️ 5m · 2m [0-9]+s left'
+  check has "▶ resume"
+  check lacks "waiting for first prompt"
+  rm -rf "$T/.claude/.token-cache"; : > "$TRANSCRIPT"; reply 400 1h   # another session file, same size
+  render '.prompt_cache = null'
+  check matches '⏱️ 1h · 5[0-9]m left'
+}
+test_resumed_session_shows_cold_from_the_transcript() {
+  plan enterprise; reply 400
+  render 'del(.prompt_cache)'
+  check has "⏱️ 5m ·  cold"
+  check has "↻ new session"             # 84k context on a cold cache
+  rm -rf "$T/.claude/.token-cache"; : > "$TRANSCRIPT"; reply 120 1h
+  with FORCE_PROMPT_CACHING_5M=1 -- render 'del(.prompt_cache)'; check matches '5m · 2m [0-9]+s left'
+}
+test_resume_estimate_yields_to_stdin_and_compaction() {
+  plan enterprise; reply 400
+  render ".prompt_cache = {ttl:\"5m\", expires_at:$((NOW+200)), warm:true, caching_observed:true}"
+  check matches '⏱️ 5m · 3m [0-9]+s left'      # Claude Code's own state wins
+  jq -nc --arg ts "$(iso $((NOW - 100)))" '{type:"system", subtype:"compact_boundary", timestamp:$ts}' >> "$TRANSCRIPT"
+  render '.prompt_cache = {ttl:"5m"}'
+  check has "5m · waiting for first prompt"   # compacted since: that cache is gone
+  check lacks "▶"
+}
+test_cache_misses_survive_a_resume() {
+  plan enterprise
+  local pc='.prompt_cache = {caching_observed:true, requests:6, misses:2, miss_recache_tokens:150000, last_miss_cause:{causes:["ttl_expired_5m"]}}'
+  render "$pc"; render "$pc"                   # the same process, rendered twice
+  check has "✗ 2 misses · 150.0k rewritten (ttl)"
+  new_process render 'del(.prompt_cache)'      # resumed: nothing from Claude Code yet
+  check has "✗ 2 misses · 150.0k rewritten (ttl)"
+  new_process render '.prompt_cache = {caching_observed:true, requests:1, misses:1, miss_recache_tokens:10000, last_miss_cause:{causes:["tools_changed"]}}'
+  check has "✗ 3 misses · 160.0k rewritten (tools)"
+  render '.prompt_cache = {caching_observed:true, requests:9, misses:3, miss_recache_tokens:200000, last_miss_cause:{causes:["ttl_expired_5m"]}}'
+  check has "✗ 4 misses · 210.0k rewritten (ttl)"   # the first process moved on: its line, not a new one
+  render '.session_id = "sess-2" | .prompt_cache = {caching_observed:true, misses:0}'
+  check lacks "✗"                                    # other sessions don't share the ledger
+  with STATUSLINE_CACHE_MISSES=0 -- render 'del(.prompt_cache)'; check lacks "✗"
+}
+test_cache_misses_keep_a_reused_process_id_apart() {
+  plan enterprise
+  render '.prompt_cache = {caching_observed:true, requests:6, misses:2, miss_recache_tokens:150000}'
+  # Same parent process id, but its counters went back: a new process that got the old id.
+  render '.prompt_cache = {caching_observed:true, requests:1, misses:1, miss_recache_tokens:5000}'
+  check has "✗ 3 misses · 155.0k rewritten"
+}
 test_cache_warm_plugin_segment() {
   plan enterprise
   local d="$T/.claude-cache-warm/sessions" ms=$((NOW*1000))
@@ -497,7 +555,7 @@ test_cold_block_reads_huge_transcripts() {
 
 # ===========================================================================
 for t in $(declare -F | awk '{print $3}' | grep '^test_' | grep -- "${1:-}"); do
-  new_home; EXTRA_ENV=(); _ok=1
+  new_home; EXTRA_ENV=(); WRAP=(); _ok=1
   "$t"
   if (( _ok )); then pass=$((pass+1)); printf '✓ %s\n' "${t#test_}"
   else fail=$((fail+1)); failed+=("$t"); printf '✗ %s\n' "${t#test_}"; fi
