@@ -151,7 +151,7 @@ echo '{"workspace":{"current_dir":"'"$PWD"'"},"model":{"display_name":"test"}}' 
 
 `jq: command not found` means jq isn't installed. Claude Code shows nothing when the command fails, and the script is written to always exit 0, so a blank line usually means a missing dependency or a wrong path in `settings.json`.
 
-**Odd characters or misaligned rows.** Your terminal's font may render emoji at an unexpected width. Set `STATUSLINE_EMOJI=0` for plain text glyphs. On narrow terminals rows wrap between segments; that needs a UTF-8 locale (`LANG=en_US.UTF-8` or similar).
+**Odd characters or misaligned rows.** Your terminal's font may render emoji at an unexpected width. Set `STATUSLINE_EMOJI=0` for plain text glyphs. On narrow terminals rows wrap between segments. If your locale is not UTF-8 (e.g. `LANG` unset), the script uses a UTF-8 locale of its own when the system has one; if none is installed, rows may wrap a little early.
 
 **No 5h / week rows.** These only appear on plans with usage limits (Pro, Max, Free) once Claude Code or the usage endpoint reports them.
 

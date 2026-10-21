@@ -308,6 +308,10 @@ IFS=$'\x1f' read -r cwd model_name model_id output_style effort_level transcript
   ] | join("")'
 )"
 
+# session_id names cache files under ~/.claude; anything that could leave those
+# folders is treated as no id at all (the per-session caches are then skipped).
+[[ "$session_id" =~ ^[A-Za-z0-9_-]+$ ]] || session_id=""
+
 # prompt_cache.ttl only arrives after the first request; until then fall back
 # to the env vars Claude Code reads (inherited by this process). 5M wins.
 if [[ -z "$pc_ttl" ]]; then
@@ -1157,6 +1161,15 @@ fi
 # $brk marks instead, carrying whole segments down. Two columns are kept spare
 # for the client's own padding. No $COLUMNS (older client): rows print as is.
 wrap_cols=$(( ${COLUMNS:-0} - 2 ))
+# Measuring and splitting rows needs bash to see characters, not bytes. Without
+# a UTF-8 locale (e.g. LANG unset), borrow one for this script if the system
+# has one; strip_sep stays byte-safe either way.
+u8="│"
+if (( wrap_cols > 0 && ${#u8} != 1 )); then
+  for l in C.UTF-8 C.utf8 en_US.UTF-8 en_US.utf8 UTF-8; do
+    if ( LC_ALL=$l; (( ${#u8} == 1 )) ) 2>/dev/null; then LC_ALL=$l; break; fi
+  done
+fi
 vis_width() {  # $1 -> REPLY: terminal columns, colour codes stripped, emoji 2 wide
   local s="$1" wide
   while [[ "$s" =~ $'\e'\[[0-9\;]*m ]]; do s="${s//"${BASH_REMATCH[0]}"/}"; done
@@ -1170,8 +1183,8 @@ strip_sep() {  # $1 -> REPLY: drop the " │ " / " · " that joined a segment to
   while [[ "$s" =~ ^($'\e'\[[0-9\;]*m) || "$s" == " "* ]]; do
     if [[ "$s" == " "* ]]; then s="${s:1}"; else pre+="${BASH_REMATCH[1]}"; s="${s:${#BASH_REMATCH[1]}}"; fi
   done
-  if [[ "$s" == [│·]* ]]; then
-    s="${s:1}"
+  if [[ "$s" == "│"* || "$s" == "·"* ]]; then
+    s="${s#│}"; s="${s#·}"
     while [[ "$s" =~ ^($'\e'\[[0-9\;]*m) ]]; do pre+="${BASH_REMATCH[1]}"; s="${s:${#BASH_REMATCH[1]}}"; done
     s="${s# }"
   fi
@@ -1200,7 +1213,7 @@ printf "${D}%s%s%s${R}${C}%s${R}${D}%s${R}" "$g_dir" "${g_dir:+ }" "$d_open" "$d
 [ -n "$git_branch" ] && printf "\x1e ${D}%s${R}${P}%s%s${R}" "$g_branch" "${g_branch:+ }" "$git_branch"
 printf "\x1e ${D}%s${R}${B}%s%s${R}" "$g_model" "${g_model:+ }" "$model_name"
 [ -n "$effort_level" ] && printf "${D} (%s)${R}" "$effort_level"
-[ "$output_style" != "null" ] && [ "$output_style" != "default" ] && printf "\x1e ${D}%s${R}${G}%s%s${R}" "$g_style" "${g_style:+ }" "$output_style"
+[ -n "$output_style" ] && [ "$output_style" != "null" ] && [ "$output_style" != "default" ] && printf "\x1e ${D}%s${R}${G}%s%s${R}" "$g_style" "${g_style:+ }" "$output_style"
 printf "\x1e ${D}%s${R}%s${bar_color}%s${R} ${D}%d%%${R}" "$g_ctx" "${g_ctx:+ }" "$bar" "$pct"
 [[ -n "$hour_seg" ]] && printf '\x1e %s' "$hour_seg"
 [[ "$bb_line" == "1" && -n "$budget_bar" ]] && printf '\x1e %s' "$budget_bar"

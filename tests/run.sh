@@ -363,6 +363,28 @@ test_narrow_terminal_wraps() {
   check exit0; check width_ok 48
   check [ "$(wc -l <<< "$PLAIN")" -gt "$wide_rows" ]
 }
+valid_utf8() { iconv -f UTF-8 -t UTF-8 <<< "$OUT" > /dev/null 2>&1 || { printf '      output is not valid UTF-8\n'; return 1; }; }
+test_wrap_without_utf8_locale() {
+  plan pro
+  local f=".effort = {level:\"high\"} | .rate_limits = {five_hour:{used_percentage:40, resets_at:$((NOW+7200))}, seven_day:{used_percentage:8, resets_at:$((NOW+3*86400))}}"
+  with LANG=C COLUMNS=50 -- render "$f"
+  check exit0; check valid_utf8; check width_ok 48
+}
+
+# ===========================================================================
+# Odd input
+# ===========================================================================
+test_missing_output_style_shows_no_segment() {
+  render 'del(.output_style)'; check exit0; check lacks "🎨"
+  render '.output_style = null'; check lacks "🎨"
+}
+test_unsafe_session_id_stays_inside_claude_dir() {
+  plan pro
+  render '.session_id = "../../escaped"'
+  check exit0; check has "Opus 5.5"
+  check [ ! -e "$T/escaped" ]; check [ ! -e "$T/escaped.txt" ]
+  check [ -z "$(find "$T" -path "$T/.claude" -prune -o -path "$T/proj" -prune -o -name 'escaped*' -print)" ]
+}
 
 # ===========================================================================
 # hooks/question-guard.sh — PostToolUse(AskUserQuestion)
